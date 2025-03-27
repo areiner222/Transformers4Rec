@@ -99,6 +99,7 @@ target/
 runs/
 wandb/
 tmp/
+sync_transformers4rec.py
 
 # PyCharm
 .idea

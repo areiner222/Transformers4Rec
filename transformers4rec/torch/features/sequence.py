@@ -27,6 +27,7 @@ from merlin.schema import Tags, TagsType
 from merlin_standard_lib import Schema
 from merlin.dataloader.ops.embeddings import EmbeddingOperator
 from merlin.core.dispatch import get_lib
+from merlin.io.worker import clean_worker_cache
 
 from ..block.base import BlockOrModule, BuildableBlock, SequentialBlock
 from ..block.mlp import MLPBlock
@@ -129,7 +130,6 @@ class TabularSequenceFeatures(TabularFeatures):
         pretrained_embedding_module: Optional[TabularModule] = None,
         pretrained_embedding_ops_module: Optional[TabularModule] = None,
         projection_module: Optional[BlockOrModule] = None,
-        # exclude_item_id_embedding: bool = False,
         masking: Optional[MaskSequence] = None,
         pre: Optional[TabularTransformationType] = None,
         post: Optional[TabularTransformationType] = None,
@@ -148,12 +148,11 @@ class TabularSequenceFeatures(TabularFeatures):
             schema=schema,
             **kwargs
         )
-        # self.exclude_item_id_embedding = exclude_item_id_embedding
         self._item_id = None
         self.projection_module = projection_module
         self.set_masking(masking)
         self._item_component_cols_set = False
-        self._cached_item_metadata = None
+        self._cached_item_metadata = {}
         self.item_filter = None
         
         # we need to ensure that we have at least one column that is an item_component
@@ -349,22 +348,24 @@ class TabularSequenceFeatures(TabularFeatures):
     # def using_item_component_embedding(self):
     #     return len(self.item_component_emb_cols) > 0 or len(self.item_component_cat_cols) > 0
     
-    def get_item_metadata(self):
-        if self._cached_item_metadata is None:
+    def get_item_metadata(self, apply_filter=True):
+        cache_key = 'filtered' if apply_filter else 'unfiltered'
+        if cache_key not in self._cached_item_metadata:
             item_col = self.schema[self.item_id]
             item_cat_path = item_col.properties['cat_path']
             item_meta = pd.read_parquet(item_cat_path)
-            if self.item_filter is not None:
+            if apply_filter and self.item_filter is not None:
                 # Perform inner join on all available columns between item_meta and item_filter
                 common_cols = list(set(item_meta.columns) & set(self.item_filter.columns))
                 item_meta = item_meta.reset_index().merge(self.item_filter, on=common_cols, how='inner').set_index('index')
                 item_meta.index.name = None
-            self._cached_item_metadata = item_meta
-        return self._cached_item_metadata
+            self._cached_item_metadata[cache_key] = item_meta
+        return self._cached_item_metadata[cache_key]
     
     def clear_item_metadata_cache(self):
         """Clear the cached item metadata. This will force a fresh load of the metadata on the next call to get_item_metadata."""
-        self._cached_item_metadata = None
+        if hasattr(self, '_cached_item_metadata'):
+            self._cached_item_metadata = {}
     
     def get_item_cat_component_metadata(self, inverse=False, _with_start_idx=False):
         comp_meta = {}
@@ -379,7 +380,7 @@ class TabularSequenceFeatures(TabularFeatures):
             comp_meta[col] = res
         return comp_meta
     
-    def build_universe_input(self, item_metadata=None):
+    def build_universe_input(self, item_metadata=None, training=False, testing=False, incl_oov_index=None):
         """
         NOTE:
         we assume that the item_metadata is monotonically indexed up to the max domain
@@ -389,7 +390,8 @@ class TabularSequenceFeatures(TabularFeatures):
                 if col not in item_metadata:
                     raise ValueError(f"item_metadata must contain all item_component_cat_cols, but {col} is missing")
         else:
-            item_metadata = self.get_item_metadata()
+            item_metadata = self.get_item_metadata(apply_filter=not (training or testing))
+        incl_oov_index = incl_oov_index if incl_oov_index is not None else (training or testing)
         # inp_idx_init = np_lib.arange(item_metadata.index.start)
         # item_metadata = item_metadata if item_metadata is not None else item_metadata_base
         # Note: if we are using a custom item_metadata, it must be true that any custom embedding ops
@@ -397,21 +399,25 @@ class TabularSequenceFeatures(TabularFeatures):
         # inp = {
         #     self.item_id: np.arange(self.schema[self.item_id].int_domain.max + 1)
         # }
+        item_ids = item_metadata.index.values
+        if incl_oov_index:
+            item_ids = np.concatenate([np.arange(3), item_ids])
         inp = {
-            self.item_id: np.concatenate([np.arange(3), item_metadata.index.values])
+            self.item_id: item_ids
         }
         meta = self.get_item_cat_component_metadata(inverse=True, _with_start_idx=True)
         for col in self.item_component_and_content_emb_cols:
             meta_col, start_idx = meta[col]
-            col_idx_init = np.arange(start_idx)
             inp_col = item_metadata[col].map(meta_col).values
-            inp_col = np.concatenate([col_idx_init, inp_col])
+            if incl_oov_index:
+                col_idx_init = np.arange(start_idx)
+                inp_col = np.concatenate([col_idx_init, inp_col])
             inp[col] = inp_col
         return inp
     
-    def build_universe(self, item_metadata=None, combine=True):
+    def build_universe(self, item_metadata=None, combine=True, training=False, testing=False, incl_oov_index=None):
         # self._set_item_component_cols()
-        inp = self.build_universe_input(item_metadata)
+        inp = self.build_universe_input(item_metadata, training=training, testing=testing, incl_oov_index=incl_oov_index)
         device = next(self.parameters()).device
         inp_pt = tree.tree_map(lambda x: torch.as_tensor(x, device=device)[None], inp)
         # out_universe = super(TabularSequenceFeatures, self).forward(inp_pt)
@@ -449,7 +455,7 @@ class TabularSequenceFeatures(TabularFeatures):
                 raise ValueError(f"item_metadata must contain all item_component_cat_cols, but {col} is missing")
         item_metadata_components_and_ids = item_metadata[item_components_and_ids].drop_duplicates(subset=item_components_and_ids)
         extend_categorify_domain(self.schema, self.item_id, {col: item_metadata_components_and_ids[col].values for col in item_components_and_ids})
-        self._cached_item_metadata = None
+        self.clear_item_metadata_cache()
         
         # extend all required content ids
         for col in list(set(self.content_id_cols + self.content_emb_cols)):
@@ -469,27 +475,39 @@ class TabularSequenceFeatures(TabularFeatures):
         
         # update pretrained embedding ops
         pemb = self.pretrained_embedding_ops_module
-        lookup_key_to_indices_values = {}
-        for col in self.content_emb_cols:
-            out_col = pemb.col_map[col]
-            item_metadata_unique = item_metadata[[col, out_col]].drop_duplicates(subset=[col])
-            new_item_ids = item_metadata_unique[col]
-            new_item_idxs = new_item_ids.map(metas[col])
-            new_embs = np.stack(item_metadata_unique[out_col].values)
-            lookup_key_to_indices_values[col] = (new_item_idxs, new_embs)
-        pemb.update_embedding_tables(lookup_key_to_indices_values)
+        if pemb is not None:
+            lookup_key_to_indices_values = {}
+            for col in self.content_emb_cols:
+                out_col = pemb.col_map[col]
+                item_metadata_unique = item_metadata[[col, out_col]].drop_duplicates(subset=[col])
+                new_item_ids = item_metadata_unique[col]
+                new_item_idxs = new_item_ids.map(metas[col])
+                new_embs = np.stack(item_metadata_unique[out_col].values)
+                lookup_key_to_indices_values[col] = (new_item_idxs, new_embs)
+            pemb.update_embedding_tables(lookup_key_to_indices_values)
+            
+        # lastly, we need to clear the worker cache
+        # this is where nvtabular may cache mapping tables for stat ops like categorify.
+        # By clearing the cache, we force reloading the new mapping tables from the parquet files
+        clean_worker_cache()
         
     def set_items_filter(self, item_filter):
         select_cols = self.schema.select_by_tag(
             [CustomTags.ITEM_ID_COMPONENT, CustomTags.ITEM_COMPONENT, CustomTags.CONTENT_ID]
         ).column_names
         self.item_filter = item_filter[[col for col in select_cols if col in item_filter.columns]]
-        self._cached_item_metadata = None
+        self.clear_item_metadata_cache()
         
     def clear_items_filter(self):
         """Clear the items filter and metadata cache. This will force a fresh load of the metadata on the next call to get_item_metadata."""
         self.item_filter = None
-        self._cached_item_metadata = None
+        self.clear_item_metadata_cache()
+        
+    def set_and_update_items_metadata(self, item_metadata):
+        self.clear_item_metadata_cache()
+        self.clear_items_filter()
+        self.update_items(item_metadata)
+        self.set_items_filter(item_metadata)
         
     def forward(self, inputs, training=False, testing=False, **kwargs):
         # self._set_item_component_cols()

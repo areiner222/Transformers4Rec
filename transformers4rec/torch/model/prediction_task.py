@@ -720,7 +720,6 @@ class TwoTowerNextItemPredictionTask(PredictionTask):
         target_dim: int = None,
         sampled_softmax: Optional[bool] = False,
         max_n_samples: Optional[int] = 100,
-        item_metadata: Optional[torch.Tensor] = None,
     ):
         super().__init__(loss=loss, metrics=metrics, task_block=task_block, task_name=task_name)
         self.softmax_temperature = softmax_temperature
@@ -732,7 +731,6 @@ class TwoTowerNextItemPredictionTask(PredictionTask):
         self.item_embedding_table = None
         self.masking = None
         self.inputs = None
-        self.item_metadata = item_metadata
 
     def build(self, body, input_size, device=None, inputs=None, task_block=None, pre=None):
         """Build method, this is called by the `Head`."""
@@ -772,7 +770,6 @@ class TwoTowerNextItemPredictionTask(PredictionTask):
         pre = TwoTowerNextItemPredictionPrepareBlock(
             target_dim=self.target_dim,
             input_layer=inputs,
-            item_metadata=self.item_metadata,
             softmax_temperature=self.softmax_temperature,
             sampled_softmax=self.sampled_softmax,
             max_n_samples=self.max_n_samples,
@@ -909,7 +906,6 @@ class TwoTowerNextItemPredictionPrepareBlock(BuildableBlock):
         self,
         target_dim: int,
         input_layer: TabularSequenceFeatures,
-        item_metadata: Optional[torch.Tensor] = None,
         softmax_temperature: float = 0,
         sampled_softmax: Optional[bool] = False,
         max_n_samples: Optional[int] = 100,
@@ -918,7 +914,6 @@ class TwoTowerNextItemPredictionPrepareBlock(BuildableBlock):
         super().__init__()
         self.target_dim = target_dim
         self.input_layer = input_layer
-        self.item_metadata = item_metadata
         self.softmax_temperature = softmax_temperature
         self.sampled_softmax = sampled_softmax
         self.max_n_samples = max_n_samples
@@ -942,7 +937,6 @@ class TwoTowerNextItemPredictionPrepareBlock(BuildableBlock):
                 input_size,
                 self.target_dim,
                 self.input_layer,
-                self.item_metadata,
                 self.softmax_temperature,
                 self.sampled_softmax,
                 self.max_n_samples,
@@ -958,7 +952,6 @@ class _TwoTowerNextItemPredictionTask(torch.nn.Module):
         input_size: Sequence,
         target_dim: int,
         input_layer: TabularSequenceFeatures,
-        item_metadata: Optional[torch.Tensor] = None,
         softmax_temperature: float = 0,
         sampled_softmax: Optional[bool] = False,
         max_n_samples: Optional[int] = 100,
@@ -970,7 +963,6 @@ class _TwoTowerNextItemPredictionTask(torch.nn.Module):
         self.softmax_temperature = softmax_temperature
         self.sampled_softmax = sampled_softmax
         self.input_layer = input_layer
-        self.item_metadata = item_metadata
         if self.sampled_softmax:
             self.sampler = LogUniformSampler(
                 max_n_samples=max_n_samples,
@@ -987,7 +979,7 @@ class _TwoTowerNextItemPredictionTask(torch.nn.Module):
         testing=False,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        output_weights = self.input_layer.build_universe(item_metadata=self.item_metadata)
+        output_weights = self.input_layer.build_universe(training=training, testing=testing)
         output_weights = output_weights.to(inputs.device)
 
         if self.sampled_softmax and training:

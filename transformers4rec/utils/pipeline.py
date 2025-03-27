@@ -180,6 +180,8 @@ def extend_categorify_domain(schema, column_name, new_values):
     
     return updated_mapping
 
+def get_all_ops(workflow, op_type):
+    return list(workflow.graph.get_nodes_by_op_type([workflow.output_node], op_type))
 
 def get_category_op(workflow, col):
     # Find the Categorify operator in the workflow

@@ -348,6 +348,11 @@ class Head(torch.nn.Module, LossMixin, MetricsMixin):
             inputs=inputs,
         )
 
+    def set_and_update_items_metadata(self, item_metadata):
+        inputs = self.body.inputs
+        if inputs is not None:
+            inputs.set_and_update_items_metadata(item_metadata)
+            
     def pop_labels(self, inputs: TabularData) -> TabularData:
         """Pop the labels from the different prediction_tasks from the inputs.
         Parameters
@@ -376,7 +381,7 @@ class Head(torch.nn.Module, LossMixin, MetricsMixin):
     ) -> Union[torch.Tensor, TabularData]:
         outputs = {}
 
-        from transformers4rec.torch.model.prediction_task import NextItemPredictionTask
+        from transformers4rec.torch.model.prediction_task import NextItemPredictionTask, TwoTowerNextItemPredictionTask
 
         if call_body:
             body_outputs = self.body(body_outputs, training=training, testing=testing, **kwargs)
@@ -403,7 +408,7 @@ class Head(torch.nn.Module, LossMixin, MetricsMixin):
             outputs = {"loss": loss, "labels": labels, "predictions": predictions}
         else:
             for name, task in self.prediction_task_dict.items():
-                if isinstance(task, NextItemPredictionTask):
+                if isinstance(task, (NextItemPredictionTask, TwoTowerNextItemPredictionTask)):
                     outputs[name] = task(
                         body_outputs,
                         targets=targets,
@@ -536,6 +541,10 @@ class Model(torch.nn.Module, LossMixin, MetricsMixin):
         self.optimizer = optimizer
         self.max_sequence_length = max_sequence_length
         self.top_k = top_k
+        
+    def set_and_update_items_metadata(self, item_metadata):
+        for head in self.heads:
+            head.set_and_update_items_metadata(item_metadata)
 
     def forward(self, inputs: TabularData, targets=None, training=False, testing=False, **kwargs):
         # Convert inputs to float32 which is the default type, expected by PyTorch

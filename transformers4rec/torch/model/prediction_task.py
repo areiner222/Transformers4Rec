@@ -28,6 +28,7 @@ from ..masking import MaskedLanguageModeling
 from ..ranking_metric import AvgPrecisionAt, NDCGAt, RecallAt
 from ..utils.torch_utils import LambdaModule
 from .base import BlockType, PredictionTask
+from ..features.sequence import TabularSequenceFeatures
 
 LOG = logging.getLogger("transformers4rec")
 
@@ -698,6 +699,336 @@ class _NextItemPredictionTask(torch.nn.Module):
     def _get_name(self) -> str:
         return "NextItemPredictionTask"
 
+
+class TwoTowerNextItemPredictionTask(PredictionTask):
+
+    DEFAULT_METRICS = (
+        # default metrics suppose labels are int encoded
+        NDCGAt(top_ks=[10, 20], labels_onehot=True),
+        AvgPrecisionAt(top_ks=[10, 20], labels_onehot=True),
+        RecallAt(top_ks=[10, 20], labels_onehot=True),
+    )
+
+    def __init__(
+        self,
+        loss: torch.nn.Module = torch.nn.CrossEntropyLoss(),
+        metrics: Iterable[tm.Metric] = DEFAULT_METRICS,
+        task_block: Optional[BlockType] = None,
+        task_name: str = "next-item",
+        softmax_temperature: float = 1,
+        padding_idx: int = 0,
+        target_dim: int = None,
+        sampled_softmax: Optional[bool] = False,
+        max_n_samples: Optional[int] = 100,
+        item_metadata: Optional[torch.Tensor] = None,
+    ):
+        super().__init__(loss=loss, metrics=metrics, task_block=task_block, task_name=task_name)
+        self.softmax_temperature = softmax_temperature
+        self.padding_idx = padding_idx
+        self.target_dim = target_dim
+        self.sampled_softmax = sampled_softmax
+        self.max_n_samples = max_n_samples
+
+        self.item_embedding_table = None
+        self.masking = None
+        self.inputs = None
+        self.item_metadata = item_metadata
+
+    def build(self, body, input_size, device=None, inputs=None, task_block=None, pre=None):
+        """Build method, this is called by the `Head`."""
+        if not len(input_size) == 3 or isinstance(input_size, dict):
+            raise ValueError(
+                "NextItemPredictionTask needs a 3-dim vector as input, found:" f"{input_size}"
+            )
+
+        # Retrieve the embedding module to get the name of itemid col and its related table
+        if not inputs:
+            inputs = body.inputs
+        self.inputs = inputs
+        if not getattr(inputs, "item_id", None):
+            raise ValueError(
+                "For Item Prediction task a categorical_module "
+                "including an item_id column is required."
+            )
+        if not self.target_dim:
+            self.target_dim = inputs.schema[inputs.item_id].int_domain.max + 1
+        item_dim = sum(inputs.item_component_and_content_out_size.values())
+        if input_size[-1] != item_dim and not task_block:
+            LOG.warning(
+                f"Projecting inputs of NextItemPredictionTask to'{item_dim}' "
+                f"As weight tying requires the input dimension '{input_size[-1]}' "
+                f"to be equal to the item-id embedding dimension '{item_dim}'"
+            )
+            # project input tensors to same dimension as item-id embeddings
+            task_block = MLPBlock([item_dim], activation=None)
+
+        # Retrieve the masking from the input block
+        self.masking = inputs.masking
+        if not self.masking:
+            raise ValueError(
+                "The input block should contain a masking schema for training and evaluation"
+            )
+        self.padding_idx = self.masking.padding_idx
+        pre = TwoTowerNextItemPredictionPrepareBlock(
+            target_dim=self.target_dim,
+            input_layer=inputs,
+            item_metadata=self.item_metadata,
+            softmax_temperature=self.softmax_temperature,
+            sampled_softmax=self.sampled_softmax,
+            max_n_samples=self.max_n_samples,
+            min_id=self.padding_idx + 1,
+        )
+        super().build(
+            body, input_size, device=device, inputs=inputs, task_block=task_block, pre=pre
+        )
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        targets=None,
+        training=False,
+        testing=False,
+        top_k=None,
+        **kwargs,
+    ):
+        if isinstance(inputs, (tuple, list)):
+            inputs = inputs[0]
+        x = inputs.float()
+
+        if self.task_block:
+            x = self.task_block(x)  # type: ignore
+
+        # Retrieve labels from masking
+        if training or testing:
+            labels = self.masking.masked_targets  # type: ignore
+            trg_flat = labels.flatten()
+            non_pad_mask = trg_flat != self.padding_idx
+            labels_all = torch.masked_select(trg_flat, non_pad_mask).long()
+            # remove padded items, keep only masked positions
+            x = self.remove_pad_3d(x, non_pad_mask)
+            y = labels_all
+            x, y = self.pre(x, targets=y, training=training, testing=testing)  # type: ignore
+
+            loss = self.loss(x, y)
+            return {
+                "loss": loss,
+                "labels": y,
+                "predictions": x,
+            }
+        else:
+            # Get the hidden position to use for predicting the next item
+            labels = self.inputs.item_seq
+            non_pad_mask = labels != self.padding_idx
+            rows_ids = torch.arange(labels.size(0), dtype=torch.long, device=labels.device)
+            if isinstance(self.masking, MaskedLanguageModeling):
+                last_item_sessions = non_pad_mask.sum(dim=1)
+            else:
+                last_item_sessions = non_pad_mask.sum(dim=1) - 1
+            x = x[rows_ids, last_item_sessions]
+
+            # Compute predictions probs
+            x, _ = self.pre(x)  # type: ignore
+
+            if top_k is None:
+                return x
+            else:
+                preds_sorted_item_scores, preds_sorted_item_ids = torch.topk(x, k=top_k, dim=-1)
+                return preds_sorted_item_scores, preds_sorted_item_ids
+
+    def remove_pad_3d(self, inp_tensor, non_pad_mask):
+        # inp_tensor: (n_batch x seqlen x emb_dim)
+        inp_tensor = inp_tensor.flatten(end_dim=1)
+        inp_tensor_fl = torch.masked_select(
+            inp_tensor, non_pad_mask.unsqueeze(1).expand_as(inp_tensor)
+        )
+        out_tensor = inp_tensor_fl.view(-1, inp_tensor.size(1))
+        return out_tensor
+
+    def calculate_metrics(self, predictions, targets) -> Dict[str, torch.Tensor]:  # type: ignore
+        if isinstance(targets, dict) and self.target_name:
+            targets = targets[self.target_name]
+
+        outputs = {}
+        predictions = self.forward_to_prediction_fn(predictions)
+
+        for metric in self.metrics:
+            result = metric(predictions, targets)
+            outputs[self.metric_name(metric)] = result
+
+        return outputs
+
+    def compute_metrics(self):
+        metrics = {
+            self.metric_name(metric): metric.compute()
+            for metric in self.metrics
+            if getattr(metric, "top_ks", None)
+        }
+        # Explode metrics for each cut-off
+        # TODO make result generic:
+        # To accept a mix of ranking metrics and others not requiring top_ks ?
+        topks = {self.metric_name(metric): metric.top_ks for metric in self.metrics}
+        results = {}
+        for name, metric in metrics.items():
+            # Fix for when using a single cut-off, as torch metrics convert results to scalar
+            # when a single element vector is returned
+            if len(metric.size()) == 0:
+                metric = metric.unsqueeze(0)
+            for measure, k in zip(metric, topks[name]):
+                results[f"{name}_{k}"] = measure
+        return results
+    
+
+class TwoTowerNextItemPredictionPrepareBlock(BuildableBlock):
+    """Prepares the output layer of the next item prediction task.
+    The output layer is a an instance of `_TwoTowerNextItemPredictionTask` class.
+
+    Parameters
+    ----------
+    target_dim: int
+        The output dimension for next-item predictions.
+    weight_tying: bool, optional
+        If true, ties the weights of the prediction layer and the item embedding layer.
+        By default False.
+    item_embedding_table: torch.nn.Module, optional
+        The module containing the item embedding table.
+        By default None.
+    softmax_temperature: float, optional
+        The temperature to be applied to the softmax function. Defaults to 0.
+    sampled_softmax: bool, optional
+        If true, sampled softmax is used for approximating the full softmax function.
+        By default False.
+    max_n_samples: int, optional
+        The maximum number of samples when using sampled softmax.
+        By default 100.
+    min_id: int, optional
+        The minimum value of the range for the log-uniform sampling.
+        By default 0.
+    """
+
+    def __init__(
+        self,
+        target_dim: int,
+        input_layer: TabularSequenceFeatures,
+        item_metadata: Optional[torch.Tensor] = None,
+        softmax_temperature: float = 0,
+        sampled_softmax: Optional[bool] = False,
+        max_n_samples: Optional[int] = 100,
+        min_id: Optional[int] = 0,
+    ):
+        super().__init__()
+        self.target_dim = target_dim
+        self.input_layer = input_layer
+        self.item_metadata = item_metadata
+        self.softmax_temperature = softmax_temperature
+        self.sampled_softmax = sampled_softmax
+        self.max_n_samples = max_n_samples
+        self.min_id = min_id
+
+    def build(self, input_size) -> Block:
+        """Builds the output layer of next-item prediction based on the input_size.
+
+        Parameters
+        ----------
+        input_size : Tuple[int]
+            The size of the input tensor, specifically the last dimension is
+            used for setting the input dimension of the output layer.
+        Returns
+        -------
+        Block[_NextItemPredictionTask]
+            an instance of _NextItemPredictionTask
+        """
+        return Block(
+            _TwoTowerNextItemPredictionTask(
+                input_size,
+                self.target_dim,
+                self.input_layer,
+                self.item_metadata,
+                self.softmax_temperature,
+                self.sampled_softmax,
+                self.max_n_samples,
+                self.min_id,
+            ),
+            [-1, self.target_dim],
+        )
+        
+        
+class _TwoTowerNextItemPredictionTask(torch.nn.Module):
+    def __init__(
+        self,
+        input_size: Sequence,
+        target_dim: int,
+        input_layer: TabularSequenceFeatures,
+        item_metadata: Optional[torch.Tensor] = None,
+        softmax_temperature: float = 0,
+        sampled_softmax: Optional[bool] = False,
+        max_n_samples: Optional[int] = 100,
+        min_id: Optional[int] = 0,
+    ):
+        super().__init__()
+        self.input_size = input_size
+        self.target_dim = target_dim
+        self.softmax_temperature = softmax_temperature
+        self.sampled_softmax = sampled_softmax
+        self.input_layer = input_layer
+        self.item_metadata = item_metadata
+        if self.sampled_softmax:
+            self.sampler = LogUniformSampler(
+                max_n_samples=max_n_samples,
+                max_id=target_dim,
+                min_id=min_id,
+                unique_sampling=True,
+            )
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        training=False,
+        testing=False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        output_weights = self.input_layer.build_universe(item_metadata=self.item_metadata)
+        output_weights = output_weights.to(inputs.device)
+
+        if self.sampled_softmax and training:
+            logits, targets = self.sampled(inputs, targets, output_weights)
+        else:
+            logits = inputs @ output_weights.t()  # type: ignore
+
+        if self.softmax_temperature:
+            # Softmax temperature to reduce model overconfidence
+            # and better calibrate probs and accuracy
+            logits = torch.div(logits, self.softmax_temperature)
+
+        return logits, targets
+
+    def sampled(self, inputs, targets, output_weights):
+        """Returns logits using sampled softmax"""
+        neg_samples, targets_probs, samples_probs = self.sampler.sample(targets)
+
+        positive_weights = output_weights[targets]
+        negative_weights = output_weights[neg_samples]
+
+        positive_scores = (inputs * positive_weights).sum(dim=-1, keepdim=True)
+        negative_scores = inputs @ negative_weights.t()
+
+        # logQ correction, to not overpenalize popular items for being sampled
+        # more often as negatives
+        epsilon = 1e-16
+        positive_scores -= torch.unsqueeze(torch.log(targets_probs + epsilon), dim=-1)
+        negative_scores -= torch.unsqueeze(torch.log(samples_probs + epsilon), dim=0)
+
+        # Remove accidental matches
+        accidental_hits = torch.unsqueeze(targets, -1) == torch.unsqueeze(neg_samples, 0)
+        negative_scores[accidental_hits] = torch.finfo(torch.float16).min / 100.0
+
+        logits = torch.cat([positive_scores, negative_scores], axis=1)
+        new_targets = torch.zeros(logits.shape[0], dtype=torch.int64, device=targets.device)
+
+        return logits, new_targets
+
+    def _get_name(self) -> str:
+        return "TwoTowerNextItemPredictionTask"
 
 class LogUniformSampler(torch.nn.Module):
     def __init__(

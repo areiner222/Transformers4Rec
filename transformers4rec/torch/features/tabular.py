@@ -20,7 +20,9 @@ from merlin.models.utils.doc_utils import docstring_parameter
 from merlin.schema import Tags, TagsType
 
 from merlin_standard_lib import Schema
+from merlin.dataloader.ops.embeddings import EmbeddingOperator
 
+from ...config.tags import CustomTags
 from ..block.base import SequentialBlock
 from ..block.mlp import MLPBlock
 from ..tabular.base import (
@@ -33,7 +35,7 @@ from ..tabular.base import (
 )
 from ..utils.torch_utils import get_output_sizes_from_schema
 from .continuous import ContinuousFeatures
-from .embedding import EmbeddingFeatures, PretrainedEmbeddingFeatures, SoftEmbeddingFeatures
+from .embedding import EmbeddingFeatures, PretrainedEmbeddingFeatures, SoftEmbeddingFeatures, PretrainedEmbeddingFeaturesCustom
 
 TABULAR_FEATURES_PARAMS_DOCSTRING = """
     continuous_module: TabularModule, optional
@@ -68,6 +70,7 @@ class TabularFeatures(MergeTabular):
         continuous_module: Optional[TabularModule] = None,
         categorical_module: Optional[TabularModule] = None,
         pretrained_embedding_module: Optional[TabularModule] = None,
+        pretrained_embedding_ops_module: Optional[TabularModule] = None,
         pre: Optional[TabularTransformationType] = None,
         post: Optional[TabularTransformationType] = None,
         aggregation: Optional[TabularAggregationType] = None,
@@ -81,9 +84,11 @@ class TabularFeatures(MergeTabular):
             to_merge["categorical_module"] = categorical_module
         if pretrained_embedding_module:
             to_merge["pretrained_embedding_module"] = pretrained_embedding_module
+        if pretrained_embedding_ops_module:
+            to_merge["pretrained_embedding_ops_module"] = pretrained_embedding_ops_module
 
         assert to_merge != {}, "Please provide at least one input layer"
-        super(TabularFeatures, self).__init__(
+        super().__init__(
             to_merge, pre=pre, post=post, aggregation=aggregation, schema=schema, **kwargs
         )
 
@@ -123,6 +128,8 @@ class TabularFeatures(MergeTabular):
         continuous_tags: Optional[Union[TagsType, Tuple[Tags]]] = (Tags.CONTINUOUS,),
         categorical_tags: Optional[Union[TagsType, Tuple[Tags]]] = (Tags.CATEGORICAL,),
         pretrained_embeddings_tags: Optional[Union[TagsType, Tuple[Tags]]] = (Tags.EMBEDDING,),
+        pretrained_embedding_ops: Optional[List[EmbeddingOperator]] = None,
+        # exclude_item_id_embedding: bool = False,
         aggregation: Optional[str] = None,
         automatic_build: bool = True,
         max_sequence_length: Optional[int] = None,
@@ -158,7 +165,8 @@ class TabularFeatures(MergeTabular):
         TabularFeatures
             Returns ``TabularFeatures`` from a dataset schema
         """
-        maybe_continuous_module, maybe_categorical_module, maybe_pretrained_module = (
+        maybe_continuous_module, maybe_categorical_module, maybe_pretrained_module, maybe_pretrained_embedding_ops_module = (
+            None,
             None,
             None,
             None,
@@ -176,18 +184,27 @@ class TabularFeatures(MergeTabular):
                     schema, tags=continuous_tags, **kwargs
                 )
         if categorical_tags:
+            # schema_cat = schema.remove_by_tag(Tags.ITEM_ID) if exclude_item_id_embedding else schema
+            schema_cat = schema.remove_by_tag(Tags.ITEM_ID).remove_by_tag(CustomTags.CONTENT_ID)
             maybe_categorical_module = cls.EMBEDDING_MODULE_CLASS.from_schema(
-                schema, tags=categorical_tags, **kwargs
+                schema_cat, tags=categorical_tags, **kwargs
             )
         if pretrained_embeddings_tags:
             maybe_pretrained_module = cls.PRETRAINED_EMBEDDING_MODULE_CLASS.from_schema(
                 schema, tags=pretrained_embeddings_tags, **kwargs
             )
-
+        if pretrained_embedding_ops:
+            maybe_pretrained_embedding_ops_module = PretrainedEmbeddingFeaturesCustom(
+                embedding_ops=pretrained_embedding_ops,
+                **kwargs,
+            )
+        
         output = cls(
             continuous_module=maybe_continuous_module,
             categorical_module=maybe_categorical_module,
             pretrained_embedding_module=maybe_pretrained_module,
+            pretrained_embedding_ops_module=maybe_pretrained_embedding_ops_module,
+            # exclude_item_id_embedding=exclude_item_id_embedding,
             aggregation=aggregation,
         )
 
@@ -235,5 +252,12 @@ class TabularFeatures(MergeTabular):
     def pretrained_module(self) -> Optional[TabularModule]:
         if "pretrained_embedding_module" in self.to_merge:
             return self.to_merge["pretrained_embedding_module"]
+
+        return None
+
+    @property
+    def pretrained_embedding_ops_module(self) -> Optional[TabularModule]:
+        if "pretrained_embedding_ops_module" in self.to_merge:
+            return self.to_merge["pretrained_embedding_ops_module"]
 
         return None

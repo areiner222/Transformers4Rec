@@ -52,7 +52,7 @@ from .losses import LabelSmoothCrossEntropyLoss
 
 # Model related imports
 from .model.base import Head, Model, PredictionTask
-from .model.prediction_task import BinaryClassificationTask, NextItemPredictionTask, RegressionTask
+from .model.prediction_task import BinaryClassificationTask, NextItemPredictionTask, RegressionTask, TwoTowerNextItemPredictionTask
 
 # Tabular related imports
 from .tabular.aggregation import (
@@ -124,6 +124,7 @@ __all__ = [
     "BinaryClassificationTask",
     "RegressionTask",
     "NextItemPredictionTask",
+    "TwoTowerNextItemPredictionTask",
     "TabularModule",
     "SoftEmbedding",
     "Trainer",

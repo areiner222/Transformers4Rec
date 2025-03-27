@@ -15,7 +15,7 @@
 #
 
 from functools import partial
-from typing import Any, Callable, Dict, List, Optional, Text, Union
+from typing import Any, Callable, Dict, List, Optional, Text, Union, Tuple
 
 import torch
 from merlin.models.utils.doc_utils import docstring_parameter
@@ -23,6 +23,7 @@ from merlin.schema import Tags, TagsType
 
 from merlin_standard_lib import Schema, categorical_cardinalities
 from merlin_standard_lib.utils.embedding_utils import get_embedding_sizes_from_schema
+from merlin.dataloader.ops.embeddings import EmbeddingOperator
 
 from ..block.base import SequentialBlock
 from ..tabular.base import (
@@ -735,3 +736,210 @@ class PretrainedEmbeddingFeatures(InputBlock):
             elif combiner == "mean":
                 combiner = torch.mean
         return combiner
+
+
+class PretrainedEmbeddingFeaturesCustom(InputBlock):
+    def __init__(
+        self, 
+        embedding_ops: List[EmbeddingOperator], 
+        pretrained_output_dims: Optional[Union[int, Dict[str, int]]] = None, 
+        sequence_combiner: Optional[Union[str, torch.nn.Module]] = None, 
+        pre: Optional[TabularTransformationType] = None, 
+        post: Optional[TabularTransformationType] = None, 
+        aggregation: Optional[TabularAggregationType] = None, 
+        normalizer: Optional[TabularTransformationType] = None, 
+        schema: Optional[Schema] = None, 
+        **kwargs
+    ):
+        if isinstance(normalizer, str):
+            normalizer = TabularTransformation.parse(normalizer)
+        if not post:
+            post = normalizer
+        elif normalizer:
+            post = SequentialBlock(normalizer, post)  # type: ignore
+
+        super().__init__(pre=pre, post=post, aggregation=aggregation, schema=schema)
+        self.embedding_ops = embedding_ops
+        self.input_names = [op.lookup_key for op in self.embedding_ops]
+        self.features = [op.embedding_name for op in self.embedding_ops]
+        self.filter_features = FilterFeatures(self.input_names)
+        self.pretrained_output_dims = pretrained_output_dims
+        self.sequence_combiner = self.parse_combiner(sequence_combiner)
+        self.col_map = {op.lookup_key: op.embedding_name for op in self.embedding_ops}
+        self.inp_to_dim = {op.lookup_key: op.embeddings.shape[-1] for op in self.embedding_ops}
+        
+        embedding_tables = {}
+        for op in self.embedding_ops:
+            if op.embedding_name not in embedding_tables:
+                embedding_tables[op.lookup_key] = self.embedding_op_to_embedding_module(op)
+
+        self.embedding_tables = torch.nn.ModuleDict(embedding_tables)
+        
+    def embedding_op_to_embedding_module(self, embedding_op: EmbeddingOperator) -> torch.nn.Embedding:
+        return torch.nn.Embedding(*embedding_op.embeddings.shape, _weight=torch.as_tensor(embedding_op.embeddings))
+
+    def build(self, input_size, **kwargs):
+        if input_size is not None:
+            if self.pretrained_output_dims:
+                self.projection = torch.nn.ModuleDict()
+                for key_inp, key_out in self.col_map.items():
+                    pretrained_output_dim = (
+                        self.pretrained_output_dims[key_inp] if isinstance(self.pretrained_output_dims, dict) 
+                        else self.pretrained_output_dims
+                    )
+                    self.projection[key_out] = torch.nn.Linear(
+                        input_size[key_inp][-1], pretrained_output_dim
+                    )
+                
+        return super().build(input_size, **kwargs)
+
+    def forward(self, inputs):
+        # get the inputs
+        filtered_inputs = self.filter_features(inputs)
+        
+        # compute the output embeddings
+        output = {}
+        for name, val in filtered_inputs.items():
+            out_name = self.col_map[name]
+            if isinstance(val, tuple):
+                values, offsets = val
+                values = torch.squeeze(values, -1)
+                # for the case where only one value in values
+                if len(values.shape) == 0:
+                    values = values.unsqueeze(0)
+                output[out_name] = self.embedding_tables[name](values, offsets[:, 0])
+            else:
+                # if len(val.shape) <= 1:
+                #    val = val.unsqueeze(0)
+                output[out_name] = self.embedding_tables[name](val)
+        
+        if self.pretrained_output_dims:
+            output = {key: self.projection[key](val) for key, val in output.items()}
+        
+        if self.sequence_combiner:
+            for key, val in output.items():
+                if val.dim() > 2:
+                    output[key] = self.sequence_combiner(val, axis=1)
+
+        return output
+
+    def forward_output_size(self, input_sizes):
+        sizes = {}
+
+        for fname, emb_name in self.col_map.items():
+            fshape = input_sizes[fname]
+            sizes[emb_name] = torch.Size(list(fshape) + [self.inp_to_dim[fname]])
+
+        return sizes
+
+    def parse_combiner(self, combiner):
+        if isinstance(combiner, str):
+            if combiner == "sum":
+                combiner = torch.sum
+            elif combiner == "max":
+                combiner = torch.max
+            elif combiner == "min":
+                combiner = torch.min
+            elif combiner == "mean":
+                combiner = torch.mean
+        return combiner
+
+    def update_embedding_table(self, lookup_key: str, indices: torch.Tensor, values: torch.Tensor):
+        """
+        Update the embedding table for a specific lookup key with new values at specified indices.
+        
+        Parameters
+        ----------
+        lookup_key : str
+            The lookup key for the embedding table to update
+        indices : torch.Tensor or numpy.ndarray
+            The indices to update in the embedding table
+        values : torch.Tensor or numpy.ndarray
+            The new values for the specified indices. Shape should be [len(indices), embedding_dim]
+        
+        Returns
+        -------
+        bool
+            True if the update was successful, False otherwise
+        """
+        if lookup_key not in self.embedding_tables:
+            raise ValueError(f"Lookup key {lookup_key} not found in embedding tables")
+        
+        embedding_table = self.embedding_tables[lookup_key]
+        current_vocab_size = embedding_table.weight.shape[0]
+        embedding_dim = embedding_table.weight.shape[1]
+        
+        # Convert indices to tensor if needed
+        if not isinstance(indices, torch.Tensor):
+            indices = torch.tensor(indices, dtype=torch.long, device=embedding_table.weight.device)
+        else:
+            indices = indices.to(device=embedding_table.weight.device, dtype=torch.long)
+        
+        # Convert values to tensor if needed
+        if not isinstance(values, torch.Tensor):
+            values = torch.tensor(values, dtype=embedding_table.weight.dtype, device=embedding_table.weight.device)
+        else:
+            values = values.to(device=embedding_table.weight.device, dtype=embedding_table.weight.dtype)
+        
+        # Check if values have the correct embedding dimension
+        if values.shape[1] != embedding_dim:
+            raise ValueError(
+                f"Values have embedding dimension {values.shape[1]}, "
+                f"but embedding table has dimension {embedding_dim}"
+            )
+        
+        # Find max index to determine if we need to expand the embedding table
+        max_index = indices.max().item()
+        
+        if max_index >= current_vocab_size:
+            # Need to expand the embedding table
+            new_vocab_size = max_index + 1
+            new_weight = torch.zeros(
+                (new_vocab_size, embedding_dim),
+                dtype=embedding_table.weight.dtype,
+                device=embedding_table.weight.device
+            )
+            
+            # Copy existing weights
+            new_weight[:current_vocab_size] = embedding_table.weight.data
+            
+            # Create new embedding table with expanded weights
+            new_embedding = torch.nn.Embedding(
+                new_vocab_size, 
+                embedding_dim,
+                _weight=new_weight
+            )
+            
+            # Replace the old embedding table with the new one
+            self.embedding_tables[lookup_key] = new_embedding
+            embedding_table = new_embedding
+            
+            # Update inp_to_dim if needed
+            self.inp_to_dim[lookup_key] = embedding_dim
+        
+        # Update the values for the specified indices
+        with torch.no_grad():
+            for i, idx in enumerate(indices):
+                embedding_table.weight[idx] = values[i]
+        
+        return True
+
+    def update_embedding_tables(self, lookup_key_to_indices_values: Dict[str, Tuple[torch.Tensor, torch.Tensor]]):
+        """
+        Update multiple embedding tables at once.
+        
+        Parameters
+        ----------
+        lookup_key_to_indices_values : Dict[str, Tuple[torch.Tensor, torch.Tensor]]
+            A dictionary mapping lookup keys to tuples of (indices, values)
+        
+        Returns
+        -------
+        bool
+            True if all updates were successful, False otherwise
+        """
+        success = True
+        for lookup_key, (indices, values) in lookup_key_to_indices_values.items():
+            success = success and self.update_embedding_table(lookup_key, indices, values)
+        
+        return success
